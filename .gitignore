@@ -1,0 +1,3 @@
+*.check.hvm
+tmp/
+.DS_Store

@@ -1,0 +1,641 @@
+#derive[match]
+type Lisp.Term {
+  list (values: List Lisp.Term)
+  atom (name: String)
+  num (value: U60)
+}
+
+Lisp.Term.Atom.to_string (term : Lisp.Term) : Maybe String
+Lisp.Term.Atom.to_string (Lisp.Term.atom name) = Maybe.some name
+Lisp.Term.Atom.to_string _term = Maybe.none
+
+// Env
+
+record Lisp.Env {
+  vars: Map Lisp.Term 
+}
+
+Lisp.Env.empty : Lisp.Env
+Lisp.Env.empty = Lisp.Env.new Map.new
+
+// Parser Implementation
+
+Lisp.parser : Parser Lisp.Env Lisp.Term 
+Lisp.parser = do Parser {
+  Parser.skip_whitespace
+  Lisp.parser.term  
+}
+
+Lisp.parser.term : Parser Lisp.Env Lisp.Term
+Lisp.parser.term = 
+  let parsers = [
+    Lisp.parser.list,
+    Lisp.parser.atom,
+    Lisp.parser.num    
+  ] 
+
+  Parser.first_of parsers
+
+Lisp.parser.list : Parser Lisp.Env Lisp.Term 
+Lisp.parser.list = do Parser {
+  Parser.char '('
+  Parser.skip_whitespace
+  ask values = Parser.sep_by Parser.whitespace Lisp.parser.term
+  Parser.skip_whitespace
+  Parser.char ')'
+
+  return Lisp.Term.list values
+}
+
+Lisp.parser.atom : Parser Lisp.Env Lisp.Term 
+Lisp.parser.atom = do Parser {
+  ask name = Lisp.parser.name
+  return Lisp.Term.atom name
+}
+
+Lisp.parser.name : Parser Lisp.Env String
+Lisp.parser.name = do Parser {
+  ask name = Parser.take_while1 (c => Lisp.parser.valid_char c)
+  return name
+}
+
+Lisp.parser.valid_char (char: Char) : Bool 
+Lisp.parser.valid_char c = 
+  let operators = ['<', '>', '=', '+', '-', '*', '/']
+  let is_operator = (x: Char) => List.any operators ((y: Char) => Char.equal x y)
+
+  (Bool.if (Bool.or (Char.is_alpha c) (is_operator c)) Bool.true Bool.false)
+
+Lisp.parser.num : Parser Lisp.Env Lisp.Term
+Lisp.parser.num = do Parser {
+  ask value = Parser.u60_decimal
+  return Lisp.Term.num value
+}
+
+// Transform 
+
+record Lisp.Hir.Lambda {
+  args: List String
+  body: Lisp.Hir
+}
+
+record Lisp.Hir.Define {
+  defn: Pair String Lisp.Hir
+  body: Lisp.Hir
+}
+
+record Lisp.Hir.If {
+  cond: Lisp.Hir
+  then: Lisp.Hir
+  else: Lisp.Hir
+}
+
+record Lisp.Hir.Call {
+  func: String
+  args: List Lisp.Hir
+}
+
+type Lisp.Hir {
+  lambda (lambda: Lisp.Hir.Lambda)
+  define (define: Lisp.Hir.Define)
+  ifstmt (ifstmt: Lisp.Hir.If)
+  call   (call: Lisp.Hir.Call)
+  list   (values: List Lisp.Hir)
+  atom   (value: String)
+  bool   (value: Bool)
+  num    (value: U60)
+}
+
+// Transform Term
+
+Lisp.Hir.from_term (term: Lisp.Term) : Maybe Lisp.Hir
+Lisp.Hir.from_term (Lisp.Term.num x) = do Maybe {
+  return (Lisp.Hir.num x)
+}
+
+Lisp.Hir.from_term (Lisp.Term.atom x) =
+  (Bool.if (String.equal x "#t") (Maybe.some (Lisp.Hir.bool Bool.true))
+  (Bool.if (String.equal x "#f") (Maybe.some (Lisp.Hir.bool Bool.false)) 
+  (Maybe.some (Lisp.Hir.atom x))))
+
+Lisp.Hir.from_term (Lisp.Term.list terms) = do Maybe {
+  Lisp.Hir.from_terms terms
+}
+
+// Transform Terms
+
+Lisp.Hir.from_terms (terms: List Lisp.Term) : Maybe Lisp.Hir
+Lisp.Hir.from_terms (List.cons (Lisp.Term.atom atom) tail) = do Maybe {
+  Lisp.Hir.from_symbol_list atom tail
+}
+
+Lisp.Hir.from_terms (List.cons head List.nil) = do Maybe {
+  Lisp.Hir.from_term head
+} 
+
+Lisp.Hir.from_terms (List.cons head tail) = do Maybe {
+  let list = List.cons Lisp.Term head tail
+  let list = Lisp.Hir.from_term (Lisp.Term.list list)
+  list
+}
+
+Lisp.Hir.from_terms (List.nil) = do Maybe {
+  return (Lisp.Hir.list [])
+}
+
+Lisp.Hir.from_symbol_list (symbol: String) (terms: List Lisp.Term) : Maybe Lisp.Hir
+Lisp.Hir.from_symbol_list identifier terms =
+  (Bool.if (String.equal identifier "define") (Lisp.Hir.from_terms.try_define terms)
+  (Bool.if (String.equal identifier "lambda") (Lisp.Hir.from_terms.try_lambda terms)
+  (Bool.if (String.equal identifier "list")   (Lisp.Hir.from_terms.try_list terms)
+  (Bool.if (String.equal identifier "if")     (Lisp.Hir.from_terms.try_ifstmt terms) 
+  (Lisp.Hir.from_terms.try_called identifier terms)))))
+
+// Transform Lambda
+
+Lisp.Hir.from_terms.try_lambda (terms: List Lisp.Term) : Maybe Lisp.Hir
+Lisp.Hir.from_terms.try_lambda (List.nil) = Maybe.none
+Lisp.Hir.from_terms.try_lambda (List.cons Lisp.Term head tail) = do Maybe {
+  match Lisp.Term head {
+    list values => do Maybe {
+      ask body = Lisp.Hir.from_terms tail
+      ask args = Lisp.Hir.from_terms.try_lambda.args head
+      let func = Lisp.Hir.Lambda.new args body
+
+      return (Lisp.Hir.lambda func)
+    }
+
+    atom name => Maybe.none
+    num value => Maybe.none
+  }
+}
+
+Lisp.Hir.from_terms.try_lambda (List.cons (List.nil) tail) = do Maybe {
+  ask body = Lisp.Hir.from_terms tail
+  
+  return (Lisp.Hir.lambda (Lisp.Hir.Lambda.new [] body))
+}
+
+// Transform Lambda args
+
+Lisp.Hir.from_terms.try_lambda.args (args: Lisp.Term) : Maybe (List String)
+Lisp.Hir.from_terms.try_lambda.args (Lisp.Term.list (List.nil)) = do Maybe {
+  return List.nil
+}
+
+Lisp.Hir.from_terms.try_lambda.args (Lisp.Term.list (List.cons arg args)) =
+  match Lisp.Term arg {
+    list values => Lisp.Hir.from_terms.try_lambda.args (Lisp.Term.list args)
+    num value => Lisp.Hir.from_terms.try_lambda.args (Lisp.Term.list args)
+    atom name => do Maybe {
+      let args = Lisp.Term.list args
+      ask args = Lisp.Hir.from_terms.try_lambda.args args
+      
+      return List.cons name args
+    }
+  }
+
+
+// Transform Define
+
+Lisp.Hir.from_terms.try_define (terms: List Lisp.Term) : Maybe Lisp.Hir
+Lisp.Hir.from_terms.try_define (List.cons Lisp.Term define body) =
+  match Lisp.Term define {
+    list values =>
+      match List values {
+        nil => Maybe.none
+        cons head tail => do Maybe {
+          ask name = Lisp.Term.Atom.to_string head
+          ask value = List.at tail (U60.to_nat 0)
+          ask value = Lisp.Hir.from_term value
+          ask body = Lisp.Hir.from_terms body
+
+          return Lisp.Hir.define (Lisp.Hir.Define.new (Pair.new name value) body)
+        }
+      }
+    atom => Maybe.none
+    num => Maybe.none
+  }
+
+// Transform If Statement
+
+Lisp.Hir.from_terms.try_ifstmt (terms: List Lisp.Term) : Maybe Lisp.Hir
+Lisp.Hir.from_terms.try_ifstmt (List.cons cond rest) = do Maybe {
+  ask cond = Lisp.Hir.from_term cond
+  ask then = List.at rest (U60.to_nat 0)
+  ask then = Lisp.Hir.from_term then
+  ask else = List.at rest (U60.to_nat 1)
+  ask else = Lisp.Hir.from_term else
+
+  return Lisp.Hir.ifstmt (Lisp.Hir.If.new cond then else)
+}
+
+Lisp.Hir.from_terms.try_list (terms: List Lisp.Term) : Maybe Lisp.Hir
+Lisp.Hir.from_terms.try_list (List.cons head tail) = do Maybe {
+  let list = List.cons Lisp.Term head tail
+  let list = List.map list (x => Lisp.Hir.from_term x)
+  ask list = Maybe.sequence list
+
+  return Lisp.Hir.list list
+}
+
+// Transform Call Function
+
+Lisp.Hir.from_terms.try_called (term: String) (terms: List Lisp.Term) : Maybe Lisp.Hir
+Lisp.Hir.from_terms.try_called func (List.cons head tail) = do Maybe {
+  let args = List.cons Lisp.Term head tail
+  let args = List.map args (arg => Lisp.Hir.from_term arg)
+  ask args = Maybe.sequence args
+
+  return Lisp.Hir.call (Lisp.Hir.Call.new func args)
+}
+
+Lisp.Hir.from_terms.try_called func List.nil = do Maybe {
+  return Lisp.Hir.atom func
+}
+
+// Environment
+
+Lisp.Entry: Type
+Lisp.Entry = Pair String Lisp.Value 
+Lisp.Entry.compare (key: String) (e: Lisp.Entry) {
+  (String.equal (Pair.fst e) key)
+}
+
+Lisp.Value.Env: Type
+Lisp.Value.Env = List Lisp.Entry
+
+Lisp.Value.Env.new: Lisp.Value.Env
+Lisp.Value.Env.new = []
+
+Lisp.Value.Env.empty : Lisp.Value.Env
+Lisp.Value.Env.empty = Lisp.Value.Env.new 
+
+Lisp.Value.Env.take (env: Lisp.Value.Env) (name: String): Pair Lisp.Value.Env (Maybe Lisp.Value)
+Lisp.Value.Env.take env key = 
+  let val = (Maybe.map (x => (Pair.snd x)) (List.head (List.filter env (e => (Lisp.Entry.compare key e)))))
+  Pair.new env val
+
+Lisp.Value.Env.subst (env: Lisp.Value.Env) (name: String) (value: Lisp.Value): Lisp.Value.Env
+Lisp.Value.Env.subst env name value = 
+  let entry = (List.head (List.filter env (e => (Lisp.Entry.compare name e))))
+  match Maybe entry {
+    some => List.map env (entry => (Bool.if (Lisp.Entry.compare name entry) (Pair.new name value) entry))
+    none => List.cons (Pair.new name value) env
+  }
+
+// Evaluate
+
+record Lisp.Value.Proc {
+  params: List String
+  body: Lisp.Hir
+  ctx: Lisp.Value.Env
+}
+
+record Lisp.Value.Call {
+  func: String
+  args: List Lisp.Value
+}
+
+record Lisp.Value.Prim {
+  fun: (Lisp.Value.Env -> List Lisp.Value -> Maybe Lisp.Value)
+}
+
+#derive[match]
+type Lisp.Value {
+  proc (proc: Lisp.Value.Proc)
+  prim (prim: Lisp.Value.Prim)
+  call (call: Lisp.Value.Call)
+  list (values: List Lisp.Value)
+  bool (value: Bool)
+  num  (value: U60)
+  atom (value: String)
+}
+
+Lisp.Evaluate.hir (env: Lisp.Value.Env) (term: Lisp.Hir) : Maybe Lisp.Value
+Lisp.Evaluate.hir env (Lisp.Hir.list values) = do Maybe {
+  let values = List.map values (value => Lisp.Evaluate.hir env value)
+  ask values = Maybe.sequence values
+
+  return (Lisp.Value.list values)
+}
+
+Lisp.Evaluate.hir env (Lisp.Hir.atom value) = do Maybe {
+  let take_value = Lisp.Value.Env.take env value
+  let snd_value = Pair.snd take_value
+
+  return match Maybe snd_value {
+    some value => value
+    none => (Lisp.Value.atom value)
+  }
+}
+
+Lisp.Evaluate.hir env (Lisp.Hir.bool value) = do Maybe {
+  return Lisp.Value.bool value
+}
+
+Lisp.Evaluate.hir env (Lisp.Hir.num value) = do Maybe {
+  return Lisp.Value.num value
+}
+
+Lisp.Evaluate.hir env (Lisp.Hir.define define) = do Maybe {
+  Lisp.Evaluate.define env define
+}
+
+Lisp.Evaluate.hir env (Lisp.Hir.lambda lambda) = do Maybe {
+  Lisp.Evaluate.lambda env lambda
+}
+
+Lisp.Evaluate.hir env (Lisp.Hir.ifstmt ifstmt) = do Maybe {
+  Lisp.Evaluate.ifstmt env ifstmt
+}
+
+Lisp.Evaluate.hir env (Lisp.Hir.call call) = do Maybe {
+  Lisp.Evaluate.call env call
+}
+
+Lisp.Evaluate.define (env: Lisp.Value.Env) (term: Lisp.Hir.Define) : Maybe Lisp.Value
+Lisp.Evaluate.define env (Lisp.Hir.Define.new (Pair.new String Lisp.Hir fst snd) body) = do Maybe {
+  ask value = Lisp.Evaluate.hir env snd
+  let env = Lisp.Value.Env.subst env fst value
+
+  Lisp.Evaluate.hir env body
+}
+
+Lisp.Evaluate.lambda (env: Lisp.Value.Env) (term: Lisp.Hir.Lambda) : Maybe Lisp.Value
+Lisp.Evaluate.lambda env (Lisp.Hir.Lambda.new params body) = do Maybe {
+  return Lisp.Value.proc (Lisp.Value.Proc.new params body env)
+}
+
+Lisp.Evaluate.ifstmt (env: Lisp.Value.Env) (term: Lisp.Hir.If) : Maybe Lisp.Value
+Lisp.Evaluate.ifstmt env (Lisp.Hir.If.new cond then else) = do Maybe {
+  ask cond = Lisp.Evaluate.hir env cond
+  Lisp.Evaluate.ifstmt.branch env cond then else
+}
+
+Lisp.Evaluate.ifstmt.branch (env: Lisp.Value.Env) (cond: Lisp.Value) (then: Lisp.Hir) (else: Lisp.Hir) : Maybe Lisp.Value
+Lisp.Evaluate.ifstmt.branch env (Lisp.Value.bool Bool.true) then _ = Lisp.Evaluate.hir env then
+Lisp.Evaluate.ifstmt.branch env (Lisp.Value.bool Bool.false) _ else = Lisp.Evaluate.hir env else
+Lisp.Evaluate.ifstmt.branch env _ _ else = Lisp.Evaluate.hir env else
+
+Lisp.Evaluate.call (env: Lisp.Value.Env) (term: Lisp.Hir.Call) : Maybe Lisp.Value
+Lisp.Evaluate.call env (Lisp.Hir.Call.new func args) = do Maybe {
+  ask eval = Lisp.Evaluate.hir env (Lisp.Hir.atom func)
+
+  let args = List.map args (arg => Lisp.Evaluate.hir env arg)
+  ask args = Maybe.sequence args
+
+  match Lisp.Value eval {
+    proc proc   => Lisp.Evaluate.call.apply_proc env proc args
+    prim prim   => Lisp.Evaluate.call.apply_prim env prim args
+    call call   => Maybe.some (Lisp.Value.call (Lisp.Value.Call.new func args))
+    list values => Maybe.some (Lisp.Value.call (Lisp.Value.Call.new func args))
+    bool value  => Maybe.some (Lisp.Value.call (Lisp.Value.Call.new func args))
+    num  value  => Maybe.some (Lisp.Value.call (Lisp.Value.Call.new func args))
+    atom value  => Maybe.some (Lisp.Value.call (Lisp.Value.Call.new func args))
+  }
+}
+
+Lisp.Evaluate.call.apply_proc (env: Lisp.Value.Env) (func: Lisp.Value.Proc) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Evaluate.call.apply_proc env (Lisp.Value.Proc.new params body ctx) args = do Maybe {
+  let env = Lisp.Evaluate.call.apply_proc.args ctx params args
+  Lisp.Evaluate.hir env body
+}
+
+Lisp.Evaluate.call.apply_proc.args (env: Lisp.Value.Env) (params: List String) (args: List Lisp.Value) : Lisp.Value.Env
+Lisp.Evaluate.call.apply_proc.args env (List.nil) (List.nil) = env
+Lisp.Evaluate.call.apply_proc.args env (List.cons String param params) (List.cons Lisp.Value arg args) =
+  let env = Lisp.Value.Env.subst env param arg
+  Lisp.Evaluate.call.apply_proc.args env params args
+
+Lisp.Evaluate.call.apply_prim (env: Lisp.Value.Env) (func: Lisp.Value.Prim) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Evaluate.call.apply_prim env (Lisp.Value.Prim.new fun) args = fun env args
+
+Lisp.Prim.Definition.required_args (args: List Lisp.Value) (size: U60) : Maybe Unit 
+Lisp.Prim.Definition.required_args args size = 
+  (Bool.if (U60.equal (Nat.to_u60 (List.length args)) size) 
+    (Maybe.some Unit.new) 
+    (Maybe.none))
+
+// Default fn tail
+
+Lisp.Prim.Definition.tail (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.tail env args = do Maybe {
+  Lisp.Prim.Definition.required_args args 1
+  
+  ask head = List.head Lisp.Value args
+  Lisp.Prim.Definition.tail_aux head
+}
+
+Lisp.Prim.Definition.tail_aux (args: Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.tail_aux (Lisp.Value.list (List.cons head tail)) = Maybe.some (Lisp.Value.list tail)
+Lisp.Prim.Definition.tail_aux _ = Maybe.some (Lisp.Value.list [])
+
+// Default fn head
+
+Lisp.Prim.Definition.head (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.head env args = do Maybe {
+  Lisp.Prim.Definition.required_args args 1
+  
+  ask head = List.head Lisp.Value args
+  Lisp.Prim.Definition.head_aux head
+}
+
+Lisp.Prim.Definition.head_aux (args: Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.head_aux (Lisp.Value.list (List.cons head tail)) = Maybe.some head
+Lisp.Prim.Definition.head_aux _ = Maybe.some (Lisp.Value.list [])
+
+// Default fn cons
+
+Lisp.Prim.Definition.cons (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.cons env args = do Maybe {
+  Lisp.Prim.Definition.required_args args 2
+  
+  ask fst = List.at Lisp.Value args (U60.to_nat 0)
+  ask snd = List.at Lisp.Value args (U60.to_nat 1)
+
+  Lisp.Prim.Definition.cons_aux fst snd
+}
+
+Lisp.Prim.Definition.cons_aux (fst: Lisp.Value) (snd: Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.cons_aux fst (Lisp.Value.list (List.cons head tail)) = Maybe.some (Lisp.Value.list (List.cons fst (List.cons Lisp.Value head tail)))
+Lisp.Prim.Definition.cons_aux fst snd = Maybe.some (Lisp.Value.list (List.cons fst [snd]))
+
+// Default is-nil
+
+Lisp.Prim.Definition.is_nil (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.is_nil env args = do Maybe {
+  Lisp.Prim.Definition.required_args args 1
+  
+  ask head = List.head Lisp.Value args
+
+  Lisp.Prim.Definition.is_nil_aux head
+}
+
+Lisp.Prim.Definition.is_nil_aux (args: Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.is_nil_aux (Lisp.Value.list (List.nil)) = Maybe.some (Lisp.Value.bool Bool.true)
+Lisp.Prim.Definition.is_nil_aux _ = Maybe.some (Lisp.Value.list [])
+
+// Default is-cons
+
+Lisp.Prim.Definition.is_cons (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.is_cons env args = do Maybe {
+  Lisp.Prim.Definition.required_args args 1
+  
+  ask head = List.head Lisp.Value args
+
+  Lisp.Prim.Definition.is_cons_aux head
+}
+
+Lisp.Prim.Definition.is_cons_aux (args: Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.is_cons_aux (Lisp.Value.list (List.cons head tail)) = Maybe.some (Lisp.Value.bool Bool.true)
+Lisp.Prim.Definition.is_cons_aux _ = Maybe.some (Lisp.Value.list [])
+
+// Default fn reverse
+
+Lisp.Prim.Definition.reverse (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.reverse env args = do Maybe {
+  Lisp.Prim.Definition.required_args args 1
+  
+  ask head = List.head Lisp.Value args
+
+  Lisp.Prim.Definition.reverse_aux head
+}
+
+Lisp.Prim.Definition.reverse_aux (args: Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.reverse_aux (Lisp.Value.list (List.cons head tail)) = Maybe.some (Lisp.Value.list (List.reverse (List.cons Lisp.Value head tail)))
+Lisp.Prim.Definition.reverse_aux _ = Maybe.some (Lisp.Value.list [])
+
+// Default Comparations
+
+Lisp.Prim.Definition.comparation (operation: U60 -> U60 -> Bool) (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.comparation operation env args = do Maybe {
+  Lisp.Prim.Definition.required_args args 2
+  
+  ask fst = List.at Lisp.Value args (U60.to_nat 0)
+  ask snd = List.at Lisp.Value args (U60.to_nat 1)
+
+  Lisp.Prim.Definition.comparation_aux operation fst snd
+}
+
+Lisp.Prim.Definition.comparation_aux (operation: U60 -> U60 -> Bool) (fst: Lisp.Value) (snd: Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.comparation_aux operation (Lisp.Value.num x) (Lisp.Value.num y) = Maybe.some (Lisp.Value.bool (operation x y))
+Lisp.Prim.Definition.comparation_aux _ _ _ = Maybe.some (Lisp.Value.bool (Bool.false))
+
+// Default operators
+
+Lisp.Prim.Definition.operator (start: U60) (operation: U60 -> U60 -> U60) (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.operator start operation env args = do Maybe {
+  ask args = Lisp.Prim.Definition.operator.args args
+  let fold = List.foldl U60 U60 start ((curr: U60) => (acc: U60) => operation acc curr) args
+
+  return Lisp.Value.num fold
+}
+
+Lisp.Prim.Definition.operator.args (args: List Lisp.Value) : Maybe (List U60)
+Lisp.Prim.Definition.operator.args args = do Maybe {
+  let args = List.map args (arg => Lisp.Prim.Definition.operator.arg arg)
+  Maybe.sequence args
+}
+
+Lisp.Prim.Definition.operator.arg (arg: Lisp.Value) : Maybe U60
+Lisp.Prim.Definition.operator.arg (Lisp.Value.num num) = Maybe.some num
+Lisp.Prim.Definition.operator.arg _ = Maybe.none
+
+// Default operator +
+
+Lisp.Prim.Definition.operator.plus (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.operator.plus env args = Lisp.Prim.Definition.operator 0 ((x: U60) => (y: U60) => (+ x y)) env args
+
+// Default operator -
+
+Lisp.Prim.Definition.operator.minus (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.operator.minus env args = Lisp.Prim.Definition.operator 0 ((x: U60) => (y: U60) => (- x y)) env args
+
+// Default operator *
+
+Lisp.Prim.Definition.operator.mult (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.operator.mult env args = Lisp.Prim.Definition.operator 1 ((x: U60) => (y: U60) => (* x y)) env args
+
+// Default operator <
+
+Lisp.Prim.Definition.operator.lt (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.operator.lt env args = Lisp.Prim.Definition.comparation ((x: U60) => (y: U60) => (U60.less_than x y)) env args
+
+// Default operator <=
+
+Lisp.Prim.Definition.operator.le (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.operator.le env args = Lisp.Prim.Definition.comparation ((x: U60) => (y: U60) => (U60.less_equal x y)) env args
+
+// Default operator >
+
+Lisp.Prim.Definition.operator.gt (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.operator.gt env args = Lisp.Prim.Definition.comparation ((x: U60) => (y: U60) => (U60.greater_than x y)) env args
+
+// Default operator >=
+
+Lisp.Prim.Definition.operator.ge (env: Lisp.Value.Env) (args: List Lisp.Value) : Maybe Lisp.Value
+Lisp.Prim.Definition.operator.ge env args = Lisp.Prim.Definition.comparation ((x: U60) => (y: U60) => (U60.greater_equal x y)) env args
+
+// Default environment
+
+Lisp.Prim.new (fun: (Lisp.Value.Env -> List Lisp.Value -> Maybe Lisp.Value)) : Lisp.Value 
+Lisp.Prim.new fun = Lisp.Value.prim (Lisp.Value.Prim.new fun)
+
+Lisp.default_env (env : Lisp.Value.Env) : Lisp.Value.Env
+Lisp.default_env env = 
+  let env = Lisp.Value.Env.subst env "reverse" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.reverse env args
+  ))
+  let env = Lisp.Value.Env.subst env "is-cons" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.is_cons env args
+  ))
+  let env = Lisp.Value.Env.subst env "is-nil" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.is_nil env args
+  ))
+  let env = Lisp.Value.Env.subst env "cons" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.cons env args
+  ))
+  let env = Lisp.Value.Env.subst env "head" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.head env args
+  ))
+  let env = Lisp.Value.Env.subst env "tail" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.tail env args
+  ))
+  let env = Lisp.Value.Env.subst env "+" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.operator.plus env args
+  ))
+  let env = Lisp.Value.Env.subst env "-" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.operator.minus env args
+  ))
+  let env = Lisp.Value.Env.subst env "*" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.operator.mult env args
+  ))
+  let env = Lisp.Value.Env.subst env "<" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.operator.lt env args
+  ))
+  let env = Lisp.Value.Env.subst env "<=" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.operator.le env args
+  ))
+  let env = Lisp.Value.Env.subst env ">" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.operator.gt env args
+  ))
+  let env = Lisp.Value.Env.subst env ">=" (Lisp.Prim.new (
+    (env: Lisp.Value.Env) => (args: List Lisp.Value) => Lisp.Prim.Definition.operator.ge env args
+  ))
+  env
+
+Main : _ { 
+  let input = "(define (test (lambda (x) (if (>= x (* 4 8)) (* x 2) (+ x 4)))) (test (* 4 8)))" // 64
+  let init  = Parser.State.new Lisp.Env.empty input "" 0
+  let env   = Lisp.default_env Lisp.Value.Env.empty
+
+  match Parser.Result r = ((Lisp.parser) init) {
+    fail state error => Maybe.none
+    done state result => do Maybe {
+      ask hir = Lisp.Hir.from_term result
+      ask res = Lisp.Evaluate.hir env hir
+      return res
+    }
+  }
+}
